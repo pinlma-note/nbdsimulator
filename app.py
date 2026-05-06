@@ -8,45 +8,27 @@ import json
 st.set_page_config(layout="wide", page_title="NBDマーケティング・シミュレータ", page_icon="📊")
 
 # ------------------------------------------------
-# 1. 数理モデル & 計算ロジック
+# マスタデータ定義
 # ------------------------------------------------
+CATEGORY_MASTERS = {
+    "ヘアケア > シャンプー": {"freq": 4.0, "k": 0.8},
+    "スキンケア > 化粧水": {"freq": 3.0, "k": 0.5},
+    "UVケア > 日焼け止め": {"freq": 2.0, "k": 0.6},
+    "洗濯・仕上げ剤 > 液体洗剤": {"freq": 10.0, "k": 0.4},
+    "バス用品 > ボディソープ": {"freq": 5.0, "k": 0.5}
+}
 
-def calculate_m_from_search(volume, category_name):
-    """
-    検索ボリュームからプレファレンスMを推定するロジック
-    M = (年間検索総数 / ターゲット母数) * カテゴリー転換係数
-    """
-    target_pop = 10000000 # ターゲット母数 1000万人
-    annual_volume = volume * 12
-    
-    # カテゴリー別の転換係数 (エボークトセットへの入りやすさ)
-    # 洗剤などは検索が少なくても習慣で買うが、美容液は検索と購買が強く連動する
-    conversion_factors = {
-        "ヘアケア > シャンプー": 0.5,
-        "スキンケア > 化粧水": 0.7,
-        "UVケア > 日焼け止め": 0.6,
-        "洗濯・仕上げ剤 > 液体洗剤": 0.3,
-        "バス用品 > ボディソープ": 0.4
-    }
-    factor = conversion_factors.get(category_name, 0.5)
-    
-    estimated_m = (annual_volume / target_pop) * factor
-    # 現実的な範囲 (0.01〜1.0) にクリップ
-    return float(np.clip(estimated_m, 0.01, 1.0))
-
+# ------------------------------------------------
+# ロジック関数
+# ------------------------------------------------
 def get_seasonality(start_month, lifetime_months, category):
-    if "UV" in category or "シャンプー" in category or "ボディソープ" in category:
+    if any(k in category for k in ["UV", "シャンプー", "ボディソープ"]):
         base_season = np.array([0.8, 0.8, 0.9, 1.1, 1.3, 1.5, 1.5, 1.4, 1.0, 0.9, 0.8, 0.8])
-    elif "保湿" in category or "スキンケア" in category:
+    elif any(k in category for k in ["保湿", "スキンケア"]):
         base_season = np.array([1.3, 1.2, 1.0, 0.9, 0.8, 0.8, 0.8, 0.9, 1.1, 1.3, 1.4, 1.4])
     else:
         base_season = np.ones(12)
-        
-    seasons = []
-    current_m = start_month - 1
-    for _ in range(lifetime_months):
-        seasons.append(base_season[current_m % 12])
-        current_m += 1
+    seasons = [base_season[(start_month - 1 + i) % 12] for i in range(lifetime_months)]
     return np.array(seasons)
 
 def simulate_plan(plan_name, p_params, env_params):
@@ -56,17 +38,20 @@ def simulate_plan(plan_name, p_params, env_params):
     
     cat = env_params['category']
     channel = env_params['channel_type']
-    base_M = p_params['pref_M'] # 各プラン固有のMを使用
+    base_M = p_params['pref_M']
     price = env_params['price']
     cost = env_params['cost']
     
+    # バリエーションによるプレファレンス分散
     var_count = p_params['variations']
     M_total = base_M * (var_count ** 0.6)
     M_indiv = (M_total / var_count) * 0.9 if var_count > 1 else M_total 
     
+    # セット率
     trt_rate = 0.85 if p_params['has_trt'] else 0.0
     trial_rate = 0.50 if p_params['has_trial'] else 0.0
     
+    # 需要計算
     awareness = min(1.0, p_params['ad_budget'] / 50000000)
     accessible_pop = target_pop * awareness * p_params['dist_rate']
     anchor_total_demand = accessible_pop * M_total
@@ -79,6 +64,7 @@ def simulate_plan(plan_name, p_params, env_params):
     monthly_demand = anchor_total_demand * diffusion * seasonality
     monthly_demand = monthly_demand * (anchor_total_demand / monthly_demand.sum()) 
     
+    # 在庫・CF計算
     inventory = np.zeros(lifetime)
     cashflow = np.zeros(lifetime)
     sales_per_store = np.zeros(lifetime)
@@ -86,11 +72,10 @@ def simulate_plan(plan_name, p_params, env_params):
     anchor_lot = p_params['initial_lot']
     trt_lot = anchor_lot * trt_rate
     trial_lot = anchor_lot * trial_rate
-    total_initial_lot = anchor_lot + trt_lot + trial_lot
     
+    initial_investment = (anchor_lot * cost) + (trt_lot * cost) + (trial_lot * cost * 0.2) + p_params['ad_budget']
     current_inv = anchor_lot 
-    initial_cost = (anchor_lot * cost) + (trt_lot * cost) + (trial_lot * cost * 0.2) + p_params['ad_budget']
-    current_cf = - initial_cost
+    current_cf = - initial_investment
     
     stockout_month = -1
     total_sales_vol = 0
@@ -109,6 +94,7 @@ def simulate_plan(plan_name, p_params, env_params):
         cashflow[i] = current_cf
         sales_per_store[i] = sales / actual_stores
 
+    # リスク判定
     avg_monthly_rev_per_store = (total_sales_vol * price * (1 + trt_rate + (trial_rate * 0.1)) / lifetime) / actual_stores
     if channel == "ドラッグストア (DG)":
         shelf_drop_risk = avg_monthly_rev_per_store < 15000
@@ -118,108 +104,130 @@ def simulate_plan(plan_name, p_params, env_params):
     
     return {
         "name": plan_name,
-        "total_sales_vol": total_sales_vol * (1 + trt_rate + trial_rate),
-        "total_revenue": current_cf + initial_cost - p_params['ad_budget'],
+        "total_revenue": current_cf + initial_investment - p_params['ad_budget'],
+        "final_cf": current_cf,
         "bottom_cf": np.min(cashflow),
-        "final_cf": cashflow[-1],
         "stockout": stockout_month > 0,
         "stockout_month": stockout_month,
         "shelf_drop": shelf_drop_risk,
         "indiv_risk": indiv_risk,
         "excess_inv": current_inv,
-        "recommended_lots": {"Main": int(anchor_lot), "Refill/Trt": int(trt_lot), "Trial": int(trial_lot)},
+        "recommended_lots": {"Main": int(anchor_lot), "Refill": int(trt_lot), "Trial": int(trial_lot)},
         "cf_history": cashflow.tolist(),
         "inv_history": inventory.tolist(),
         "params": p_params
     }
 
 # ------------------------------------------------
-# 2. UI・ダッシュボード構築
+# UI構築
 # ------------------------------------------------
-st.title("📊 NBDモデル 販売需要シミュレータ")
+st.title("📊 NBDフル機能シミュレータ")
 
+# --- 保存・読込 ---
 with st.sidebar:
-    st.subheader("💾 データ保存・読込")
-    st.file_uploader("設定ファイルを読み込む (.json)", type="json")
+    st.header("💾 データ管理")
+    uploaded_file = st.file_uploader("JSON設定を読み込む", type="json")
+    if uploaded_file:
+        st.success("読込完了")
 
-# --- STEP1: 市場環境と検索ボリューム ---
-st.header("⚙️ STEP1: カテゴリと検索需要の分析")
+# --- STEP1: 市場環境 ---
+st.header("⚙️ STEP1: カテゴリ・市場・M値設定")
 c1, c2, c3 = st.columns(3)
 with c1:
-    cat_major = st.selectbox("大カテゴリ", ["ビューティー", "日用品・ヘルスケア"])
+    cat_minor = st.selectbox("小カテゴリ", list(CATEGORY_MASTERS.keys()))
+    cat_info = CATEGORY_MASTERS[cat_minor]
 with c2:
-    if cat_major == "ビューティー":
-        cat_minor = st.selectbox("小カテゴリ", ["ヘアケア > シャンプー", "スキンケア > 化粧水", "UVケア > 日焼け止め"])
-    else:
-        cat_minor = st.selectbox("小カテゴリ", ["洗濯・仕上げ剤 > 液体洗剤", "バス用品 > ボディソープ"])
+    start_month = st.number_input("発売開始月", 1, 12, 3)
 with c3:
-    start_month = st.number_input("発売開始月 (1〜12月)", 1, 12, 3)
-
-c4, c5, c6 = st.columns(3)
-with c4:
     channel_type = st.selectbox("主戦場チャネル", ["ドラッグストア (DG)", "バラエティショップ (VS)"])
-with c5:
-    brand_name = st.text_input("ブランド名", placeholder="例：新・ボタニカルシャンプー")
-with c6:
-    search_volume = st.number_input("月間指名検索ボリューム (推定)", value=50000, step=1000, help="Google等でのブランド名・関連語の月間検索数")
 
-# AIによるM値の推定
-ai_m_value = calculate_m_from_search(search_volume, cat_minor)
+m_mode = st.radio("M値の設定方法", ["シェアから逆算", "直接入力"], horizontal=True)
+if m_mode == "シェアから逆算":
+    target_share = st.slider("目標ユニットシェア (%)", 0.1, 10.0, 2.0)
+    calculated_m = cat_info['freq'] * (target_share / 100)
+    st.info(f"算出プレファレンス(M): {calculated_m:.3f}")
+else:
+    calculated_m = st.number_input("直接入力(M)", 0.01, 1.00, 0.10)
 
-if brand_name:
-    st.success(f"🤖 **AI需要判定:** 指名検索数 {search_volume:,}/月 に基づき、このブランドの初期プレファレンス(M)を **{ai_m_value:.3f}** と推定しました。")
-    st.info(f"※ターゲット母数1000万人に対し、年間約{(search_volume*12/10000000)*100:.1f}%のリーチ。カテゴリー転換率を考慮した実売期待値です。")
+st.divider()
 
-st.markdown("---")
-
-# --- STEP2: シナリオ入力 ---
-st.header("📝 STEP2: ブランド戦略の入力")
-c_price, c_cost = st.columns(2)
-price = c_price.number_input("メインSKU 販売単価 (円)", value=1500)
-cost = c_cost.number_input("メインSKU 製造原価 (円)", value=400)
+# --- STEP2: 戦略とコスト ---
+st.header("📝 STEP2: ブランド戦略とコスト設定")
+c_price, c_cost, c_brand = st.columns(3)
+price = c_price.number_input("単価(円)", value=1500)
+cost = c_cost.number_input("原価(円)", value=400)
+brand_name = c_brand.text_input("ブランド名", "New Brand")
 
 env_params = {"category": cat_minor, "start_month": start_month, "channel_type": channel_type, "price": price, "cost": cost}
 
 colA, colB = st.columns(2)
-def input_plan(label, key_suffix, def_lot, def_ad, def_dist, def_var, def_trt, def_trial, recommended_m):
+def input_plan(label, key, def_lot, def_ad, def_dist, m_val):
     with st.container(border=True):
         st.subheader(label)
-        # AIが判定したM値を初期値にする
-        pref = st.slider(f"プレファレンス(M) - {key_suffix}", 0.01, 1.00, recommended_m, 0.01, key=f"m{key_suffix}")
-        var_count = st.number_input("バリエーション数", 1, 5, def_var, key=f"var{key_suffix}")
-        cc1, cc2 = st.columns(2)
-        has_trt = cc1.checkbox("連動SKUあり", value=def_trt, key=f"trt{key_suffix}")
-        has_trial = cc2.checkbox("トライアルSKUあり", value=def_trial, key=f"trial{key_suffix}")
-        
-        lot = st.number_input("メインSKU 初回ロット (個)", value=def_lot, key=f"lot{key_suffix}")
-        ad = st.number_input("広告予算 (円)", value=def_ad, key=f"ad{key_suffix}")
-        dist = st.slider("目標配荷率", 0.1, 1.0, def_dist, key=f"dist{key_suffix}")
-        return {"pref_M": pref, "variations": var_count, "has_trt": has_trt, "has_trial": has_trial, "initial_lot": lot, "ad_budget": ad, "dist_rate": dist}
+        p_m = st.number_input(f"M値 - {key}", value=m_val, key=f"m{key}")
+        vars = st.number_input("バリエーション数", 1, 5, 1, key=f"v{key}")
+        t1, t2 = st.columns(2)
+        has_trt = t1.checkbox("連動SKUあり", value=True, key=f"t{key}")
+        has_trial = t2.checkbox("トライアルSKUあり", value=False, key=f"tr{key}")
+        lot = st.number_input("初回ロット", value=def_lot, key=f"l{key}")
+        ad = st.number_input("広告予算", value=def_ad, key=f"a{key}")
+        dist = st.slider("目標配荷率", 0.1, 1.0, def_dist, key=f"d{key}")
+        return {"pref_M": p_m, "variations": vars, "has_trt": has_trt, "has_trial": has_trial, "initial_lot": lot, "ad_budget": ad, "dist_rate": dist}
 
 with colA:
-    pA = input_plan("🔥 プラン A (強気)", "A", 200000, 30000000, 0.8, 3, True, False, ai_m_value)
+    pA = input_plan("プラン A", "A", 200000, 30000000, 0.8, calculated_m)
 with colB:
-    pB = input_plan("🛡️ プラン B (保守的)", "B", 100000, 15000000, 0.4, 1, True, True, ai_m_value)
+    pB = input_plan("プラン B", "B", 80000, 10000000, 0.4, calculated_m)
 
-# --- STEP3: AI軍師補正 ---
-if st.button("✨ AI補正プラン(C)を作成", type="primary"):
-    new_lot = int(simulate_plan("temp", pA, env_params)['total_sales_vol'] * 0.4) # 適正ロットへ
-    pC = {"pref_M": ai_m_value, "variations": 2, "has_trt": True, "has_trial": True, "initial_lot": new_lot, "ad_budget": 20000000, "dist_rate": 0.6}
-    st.session_state['pC'] = pC
+# --- プランC生成 ---
+if st.button("🤖 AI補正プラン(C)を作成", type="primary"):
+    res_A = simulate_plan("temp", pA, env_params)
+    new_lot = int(res_A['total_revenue'] / price * 0.5) if res_A['stockout'] else pA['initial_lot']
+    st.session_state['pC'] = {"pref_M": calculated_m, "variations": 1, "has_trt": True, "has_trial": True, "initial_lot": max(50000, new_lot), "ad_budget": 15000000, "dist_rate": 0.5}
 
-results = [simulate_plan("A", pA, env_params), simulate_plan("B", pB, env_params)]
+# 実行
+current_plans = [("A", pA), ("B", pB)]
 if 'pC' in st.session_state:
-    results.append(simulate_plan("C", st.session_state['pC'], env_params))
+    current_plans.append(("C", st.session_state['pC']))
 
-# --- STEP4: 結果表示 ---
-st.markdown("---")
-st.header("📈 シミュレーション結果")
-kpi_cols = st.columns(len(results))
-for idx, r in enumerate(results):
-    with kpi_cols[idx]:
-        with st.container(border=True):
-            st.markdown(f"### プラン {r['name']}")
-            st.metric("累計売上高", f"¥{int(r['total_revenue']):,}")
-            st.metric("ボトムCF", f"¥{int(r['bottom_cf']):,}", delta="要資金調達" if r['bottom_cf'] < -50000000 else "安全")
-            st.markdown(f"**欠品:** {'⚠️ あり' if r['stockout'] else '✅ なし'}")
-            st.markdown(f"**棚落ち:** {'💥 危険' if r['shelf_drop'] else '✅ 安全'}")
+results = [simulate_plan(name, params, env_params) for name, params in current_plans]
+
+st.divider()
+
+# --- STEP4: 結果・エクスポート ---
+st.header("📈 シミュレーション結果とエクスポート")
+
+# KPIテーブル
+df_res = pd.DataFrame([{
+    "プラン": r['name'],
+    "累計売上": f"¥{int(r['total_revenue']):,}",
+    "ボトムCF": f"¥{int(r['bottom_cf']):,}",
+    "欠品発生": "⚠️" if r['stockout'] else "✅",
+    "棚落ちリスク": "❌" if r['shelf_drop'] else "✅",
+    "カニバリリスク": "⚠️" if r['indiv_risk'] else "✅",
+    "残在庫": f"{int(r['excess_inv']):,}"
+} for r in results])
+st.table(df_res)
+
+# ロット詳細
+with st.expander("📦 推奨生産ロット詳細"):
+    for r in results:
+        st.write(f"**プラン {r['name']}**: メイン {r['recommended_lots']['Main']:,} / 連動 {r['recommended_lots']['Refill']:,} / トライアル {r['recommended_lots']['Trial']:,}")
+
+# グラフ
+c1, c2 = st.columns(2)
+with c1:
+    st.subheader("キャッシュフロー推移")
+    f_cf = go.Figure()
+    for r in results: f_cf.add_trace(go.Scatter(y=r['cf_history'], name=f"Plan {r['name']}"))
+    st.plotly_chart(f_cf, use_container_width=True)
+with c2:
+    st.subheader("在庫推移")
+    f_inv = go.Figure()
+    for r in results: f_inv.add_trace(go.Scatter(y=r['inv_history'], name=f"Plan {r['name']}"))
+    st.plotly_chart(f_inv, use_container_width=True)
+
+# エクスポート
+st.sidebar.divider()
+st.sidebar.download_button("💾 設定をJSON保存", data=json.dumps({"params": [p for n, p in current_plans], "env": env_params}), file_name="nbd_config.json")
+st.sidebar.download_button("📑 レポートをCSV出力", data=df_res.to_csv(index=False).encode('utf-8-sig'), file_name="nbd_report.csv")
